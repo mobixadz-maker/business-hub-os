@@ -997,4 +997,276 @@ index 0000000..1b64482
 +        sa.Column("usage_date", sa.String(10), nullable=False),
 +        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
 +    )
-+    op.create_index("ix_ai_usage_user_id", "ai_usage", ["user_id"])
++    op.create_index("ix_ai_usage_user_id", "ai_usage", ["user_id"])+    op.create_index("ix_ai_usage_usage_date", "ai_usage", ["usage_date"])
++
++
++def downgrade():
++    op.drop_index("ix_ai_usage_usage_date", table_name="ai_usage")
++    op.drop_index("ix_ai_usage_user_id", table_name="ai_usage")
++    op.drop_table("ai_usage")
+diff --git a/migrations/versions/0006_agent_memory.py b/migrations/versions/0006_agent_memory.py
+new file mode 100644
+index 0000000..444b15e
+--- /dev/null
++++ b/migrations/versions/0006_agent_memory.py
+@@ -0,0 +1,32 @@
++"""Add scoped persistent agent memory."""
++from alembic import op
++import sqlalchemy as sa
++
++revision = "0006_agent_memory"
++down_revision = "0005_ai_runtime"
++branch_labels = None
++depends_on = None
++
++def upgrade():
++    op.create_table(
++        "agent_memories",
++        sa.Column("id", sa.String(36), primary_key=True),
++        sa.Column("agent_id", sa.String(100), nullable=False),
++        sa.Column("owner_user_id", sa.String(36), sa.ForeignKey("users.id", ondelete="CASCADE"), nullable=True),
++        sa.Column("visibility", sa.String(16), nullable=False),
++        sa.Column("memory_type", sa.String(40), nullable=False),
++        sa.Column("content", sa.Text(), nullable=False),
++        sa.Column("importance", sa.Integer(), nullable=False),
++        sa.Column("status", sa.String(16), nullable=False),
++        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
++        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
++    )
++    op.create_index("ix_agent_memories_agent_id", "agent_memories", ["agent_id"])
++    op.create_index("ix_agent_memories_owner_user_id", "agent_memories", ["owner_user_id"])
++    op.create_index("ix_agent_memories_status", "agent_memories", ["status"])
++
++def downgrade():
++    op.drop_index("ix_agent_memories_status", table_name="agent_memories")
++    op.drop_index("ix_agent_memories_owner_user_id", table_name="agent_memories")
++    op.drop_index("ix_agent_memories_agent_id", table_name="agent_memories")
++    op.drop_table("agent_memories")
+diff --git a/pyproject.toml b/pyproject.toml
+index 150ad37..049a21d 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,6 +1,6 @@
+ [project]
+ name = "business-hub-os"
+-version = "0.3.0"
++version = "0.7.0"
+ description = "Modular AI-native ecommerce business operating system"
+ requires-python = ">=3.11"
+ dependencies = [
+diff --git a/tests/test_api.py b/tests/test_api.py
+index 584f412..f517656 100644
+--- a/tests/test_api.py
++++ b/tests/test_api.py
+@@ -110,3 +110,211 @@ def test_viewer_cannot_read_approval_queue():
+     })
+     viewer = {"Authorization": f"Bearer {login.json()['access_token']}"}
+     assert client.get("/api/v1/approvals", headers=viewer).status_code == 403
++
++
++def test_agent_run_persists_safe_execution_and_is_idempotent():
++    headers = {**OWNER, "Idempotency-Key": "research-run-001"}
++    payload = {"tool_name": "catalog.read", "input_data": {"category": "skincare"}}
++    first = client.post("/api/v1/agents/product-research/runs", headers=headers, json=payload)
++    second = client.post("/api/v1/agents/product-research/runs", headers=headers, json=payload)
++    assert first.status_code == 201 and second.status_code == 201
++    assert first.json()["id"] == second.json()["id"]
++    assert first.json()["status"] == "completed"
++    assert first.json()["output"]["mode"] == "simulated"
++    assert client.get(f"/api/v1/agent-runs/{first.json()['id']}", headers=OWNER).status_code == 200
++
++
++def test_agent_run_denies_unlisted_or_wrong_department_tool():
++    response = client.post("/api/v1/agents/product-research/runs", headers=OWNER, json={
++        "tool_name": "payment.refund", "input_data": {"amount": 10}
++    })
++    assert response.status_code == 403
++
++
++def test_sensitive_agent_run_waits_for_human_approval():
++    created = client.post("/api/v1/agents/marketing-analyst/runs", headers=OWNER, json={
++        "tool_name": "campaign.publish", "input_data": {"campaign_id": "demo"}
++    })
++    assert created.status_code == 201
++    run = created.json()
++    assert run["status"] == "waiting_approval"
++    assert run["approval_status"] == "pending"
++    assert run["output"] is None
++    approved = client.post(f"/api/v1/agent-runs/{run['id']}/approval", headers=OWNER, json={
++        "decision": "approved", "reason": "Reviewed by owner"
++    })
++    assert approved.status_code == 200
++    assert approved.json()["status"] == "approved"
++    assert approved.json()["output"]["mode"] == "approval_only"
++    assert approved.json()["approved_by"] == "owner@example.com"
++
++
++def test_agent_run_approval_rejected_for_viewer():
++    run = client.post("/api/v1/agents/marketing-analyst/runs", headers=OWNER, json={
++        "tool_name": "campaign.publish", "input_data": {}
++    }).json()
++    login = client.post("/api/v1/auth/login", json={
++        "email": "viewer@example.com", "password": "viewer-password-123"
++    })
++    viewer = {"Authorization": f"Bearer {login.json()['access_token']}"}
++    assert client.post(f"/api/v1/agent-runs/{run['id']}/approval", headers=viewer, json={
++        "decision": "approved"
++    }).status_code == 403
++
++
++def test_workflow_executes_safe_steps_sequentially_and_persists():
++    response = client.post("/api/v1/workflows/runs", headers=OWNER, json={
++        "name": "Product research workflow",
++        "steps": [
++            {"agent_id": "product-research", "tool_name": "catalog.read", "input_data": {"category": "skincare"}},
++            {"agent_id": "data-analyst", "tool_name": "report.generate", "input_data": {"format": "summary"}},
++        ],
++    })
++    assert response.status_code == 201, response.text
++    workflow = response.json()
++    assert workflow["status"] == "completed"
++    assert [step["status"] for step in workflow["steps"]] == ["completed", "completed"]
++    fetched = client.get(f"/api/v1/workflow-runs/{workflow['id']}", headers=OWNER)
++    assert fetched.status_code == 200
++    assert fetched.json()["current_step"] == 2
++
++
++def test_workflow_halts_at_approval_and_never_executes_external_side_effect():
++    response = client.post("/api/v1/workflows/runs", headers=OWNER, json={
++        "name": "Campaign approval workflow",
++        "steps": [
++            {"agent_id": "marketing-analyst", "tool_name": "campaign.publish", "input_data": {"campaign_id": "demo"}},
++            {"agent_id": "data-analyst", "tool_name": "report.generate", "input_data": {"format": "after-launch"}},
++        ],
++    })
++    assert response.status_code == 201, response.text
++    workflow = response.json()
++    assert workflow["status"] == "waiting_approval"
++    assert workflow["steps"][0]["status"] == "waiting_approval"
++    assert workflow["steps"][1]["status"] == "pending"
++    run_id = workflow["steps"][0]["agent_run_id"]
++    approved = client.post(f"/api/v1/agent-runs/{run_id}/approval", headers=OWNER, json={
++        "decision": "approved", "reason": "Reviewed"
++    })
++    assert approved.status_code == 200
++    resumed = client.post(f"/api/v1/workflow-runs/{workflow['id']}/resume", headers=OWNER)
++    assert resumed.status_code == 200
++    assert resumed.json()["status"] == "paused_approved_not_executed"
++    assert resumed.json()["steps"][0]["status"] == "approved_not_executed"
++    assert resumed.json()["steps"][1]["status"] == "pending"
++
++
++def test_workflow_rejects_invalid_tool_and_records_failure():
++    response = client.post("/api/v1/workflows/runs", headers=OWNER, json={
++        "name": "Invalid tool workflow",
++        "steps": [{"agent_id": "product-research", "tool_name": "payment.refund", "input_data": {}}],
++    })
++    assert response.status_code == 201
++    assert response.json()["status"] == "failed"
++    assert response.json()["steps"][0]["status"] == "failed"
++
++
++def test_workflow_step_count_is_bounded():
++    response = client.post("/api/v1/workflows/runs", headers=OWNER, json={
++        "name": "Too many steps",
++        "steps": [{"agent_id": "product-research"} for _ in range(21)],
++    })
++    assert response.status_code == 422
++
++
++def test_ai_provider_catalog_is_mock_only_and_requires_auth():
++    assert client.get("/api/v1/ai/providers").status_code == 401
++    response = client.get("/api/v1/ai/providers", headers=OWNER)
++    assert response.status_code == 200
++    data = response.json()
++    assert data["live_calls_enabled"] is False
++    assert {item["id"] for item in data["providers"]} == {"openai", "anthropic", "google"}
++    assert all(item["mode"] == "mock" and item["live_enabled"] is False for item in data["providers"])
++
++
++def test_ai_runtime_routes_by_task_and_records_usage():
++    response = client.post("/api/v1/ai/generate", headers=OWNER, json={
++        "prompt": "Summarize product demand", "task": "research", "max_output_tokens": 128
++    })
++    assert response.status_code == 200, response.text
++    result = response.json()
++    assert result["provider"] == "google"
++    assert result["mode"] == "mock" and result["live_call"] is False
++    assert result["text"].startswith("[SIMULATED:google/mock-gemini]")
++    assert result["usage"]["input_tokens"] > 0
++
++
++def test_ai_runtime_allows_explicit_provider_and_rejects_unknown():
++    response = client.post("/api/v1/ai/generate", headers=OWNER, json={
++        "prompt": "Draft product copy", "task": "creative", "provider": "anthropic"
++    })
++    assert response.status_code == 200
++    assert response.json()["provider"] == "anthropic"
++    unknown = client.post("/api/v1/ai/generate", headers=OWNER, json={
++        "prompt": "Hello", "provider": "unlisted-provider"
++    })
++    assert unknown.status_code == 400
++
++
++def test_ai_runtime_enforces_token_and_daily_cost_budgets():
++    over_tokens = client.post("/api/v1/ai/generate", headers=OWNER, json={
++        "prompt": "Hello", "max_output_tokens": settings.ai_max_output_tokens + 1
++    })
++    assert over_tokens.status_code == 422
++    original_budget = settings.ai_daily_budget_usd
++    try:
++        settings.ai_daily_budget_usd = 0.0
++        over_budget = client.post("/api/v1/ai/generate", headers=OWNER, json={"prompt": "Hello"})
++        assert over_budget.status_code == 429
++    finally:
++        settings.ai_daily_budget_usd = original_budget
++
++
++def test_ai_runtime_does_not_accept_or_echo_api_keys():
++    response = client.post("/api/v1/ai/generate", headers=OWNER, json={
++        "prompt": "Safe test", "api_key": "do-not-store-this-secret"
++    })
++    assert response.status_code == 200
++    assert "do-not-store-this-secret" not in response.text
++    assert "api_key" not in response.json()
++
++
++def test_agent_memory_shared_and_private_scoping():
++    shared = client.post("/api/v1/agents/product-research/memory", headers=OWNER, json={
++        "content": "Prioritize products with clear supplier documentation", "visibility": "shared",
++        "memory_type": "preference", "importance": 5})
++    assert shared.status_code == 201, shared.text
++    private = client.post("/api/v1/agents/product-research/memory", headers=OWNER, json={
++        "content": "Owner-only planning note", "visibility": "private"})
++    assert private.status_code == 201
++    listed = client.get("/api/v1/agents/product-research/memory", headers=OWNER)
++    assert {item["id"] for item in listed.json()} == {shared.json()["id"], private.json()["id"]}
++
++
++def test_agent_memory_rejects_secrets_and_unknown_agents():
++    secret = client.post("/api/v1/agents/product-research/memory", headers=OWNER, json={
++        "content": "api_key=super-secret-value"})
++    assert secret.status_code == 422
++    unknown = client.get("/api/v1/agents/not-real/memory", headers=OWNER)
++    assert unknown.status_code == 404
++
++
++def test_ai_generation_can_use_agent_shared_memory():
++    saved = client.post("/api/v1/agents/creative-director/memory", headers=OWNER, json={
++        "content": "Brand voice should be concise and factual", "visibility": "shared"})
++    assert saved.status_code == 201
++    response = client.post("/api/v1/ai/generate", headers=OWNER, json={
++        "prompt": "Write a product summary", "agent_id": "creative-director",
++        "task": "creative", "max_output_tokens": 128})
++    assert response.status_code == 200, response.text
++    assert "Brand voice should be concise and factual" in response.json()["text"]
++
++
++def test_agent_memory_archive():
++    saved = client.post("/api/v1/agents/data-analyst/memory", headers=OWNER, json={
++        "content": "Prefer weekly summaries"})
++    assert saved.status_code == 201
++    archived = client.post(f"/api/v1/agent-memory/{saved.json()['id']}/archive", headers=OWNER)
++    assert archived.status_code == 200 and archived.json()["status"] == "archived"
++    remaining = client.get("/api/v1/agents/data-analyst/memory", headers=OWNER).json()
++    assert all(item["id"] != saved.json()["id"] for item in remaining)
